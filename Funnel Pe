@@ -1,0 +1,717 @@
+with fecha_pais as (
+	with fecha as (
+			select distinct 
+			date as fecha
+			from  dwh.dim_date  
+			where date>='2022-01-01' and date<=current_date),
+	pais as (
+			select distinct  
+			country_iso as pais_iso,
+			translate(country_desc,'áéíóúÁÉÍÓÚ','aeiouAEIOU') as pais
+			from dwh.dim_geography dg 
+			where country_iso in ('PE'))
+	select *
+	from fecha
+	left join pais on 1=1
+	),
+spend as (
+	with base as (	
+		with base_cotizaciones as (
+			with fechas as (	
+				select distinct 
+				exchange_date from serving.exchange_rates
+				where exchange_date>='2022-01-01'),			
+			monedas as (
+				select distinct
+				source_country_2lett_acronym
+				,source_currency_3lett_acronym
+				,destin_currency_3lett_acronym
+				,exchange_source
+				from serving.exchange_rates
+				where source_country_2lett_acronym in ('PE') 
+				and destin_currency_3lett_acronym='USD'
+				and exchange_source in ('rava_ccl', 'google_finance')
+				),
+			cotizaciones as (
+				select *
+				from serving.exchange_rates
+				where exchange_date>='2022-01-01' and amt_sourc_destin_exch_rate is not null
+				and destin_currency_3lett_acronym='USD'
+				and exchange_source in ('rava_ccl', 'google_finance')
+				)	
+			select
+			fechas.*
+			,monedas.*
+			,case when cotizaciones.exchange_date= max (cotizaciones.exchange_date)
+			over (partition by fechas.exchange_date
+				,monedas.source_country_2lett_acronym
+				,monedas.source_currency_3lett_acronym
+				,monedas.destin_currency_3lett_acronym
+				,monedas.exchange_source) 
+			then cotizaciones.amt_sourc_destin_exch_rate end as tc
+			from fechas
+			left join  monedas 	on 1=1
+			left join  cotizaciones 
+			on fechas.exchange_date>=cotizaciones.exchange_date
+			and monedas.source_country_2lett_acronym=cotizaciones.source_country_2lett_acronym
+			and monedas.exchange_source=cotizaciones.exchange_source
+		),
+		tc_ajustado as (
+				select * 
+				from base_cotizaciones where tc is not null),
+		usd_ars as (
+			select *
+			from tc_ajustado
+			where source_country_2lett_acronym ='AR' and exchange_source ='rava_ccl'),	
+		nc_ars as (
+			with nc_usd as (
+				select
+				exchange_date,
+				source_country_2lett_acronym,
+				tc
+				from tc_ajustado
+				where exchange_source='google_finance'),	
+			ars_usd as (
+				select
+				exchange_date,
+				tc
+				from tc_ajustado
+				where source_country_2lett_acronym='AR' and exchange_source='google_finance')	
+		select
+		nc_usd.exchange_date,
+		nc_usd.source_country_2lett_acronym,
+		nc_usd.tc/ars_usd.tc as conv_ars
+		from nc_usd
+		left join ars_usd on nc_usd.exchange_date=ars_usd.exchange_date),
+		spend as (
+		select 
+		to_date(start_date,'YYYY-MM-DD') AS date_start
+		,country_from_account_id
+		,platform_source
+		,c_funnel_label
+		,spend
+		,updated_campaign_name as campaign_name
+		from serving.ad_consolidation
+		where start_date >='2022-01-01' and country_from_account_id in ('PE') and start_date<current_date
+		AND is_active = true
+		)
+		select
+		spend.date_start,
+		spend.country_from_account_id,
+		spend.platform_source,
+		spend.c_funnel_label,
+		--usd_ars.tc,
+		--spend.campaign_name,
+		--spend.spend,
+		case 
+			when spend.platform_source='Google Ads' then sum(spend.spend/(nc_ars.conv_ars*usd_ars.tc))
+		 	when spend.platform_source='Facebook Ads' then sum(spend.spend*1.08/usd_ars.tc) 
+			else sum(spend.spend/usd_ars.tc)  end
+		as spend_usd
+	from  spend
+	left join usd_ars on usd_ars.exchange_date=spend.date_start
+	left join nc_ars on nc_ars.exchange_date=spend.date_start and spend.country_from_account_id=nc_ars.source_country_2lett_acronym
+	--where spend.country_from_account_id='AR' and spend.campaign_name='ar-bue-sales-leadgen-remarketing-display-es-low-rmkt- Nueva'
+	group by 1,2,3,4
+	order by 1 desc, 2,3,4
+	)
+select 
+base.date_start as fecha,
+base.country_from_account_id as pais,
+sum (case when base.c_funnel_label='brand' then base.spend_usd end) as spend_online_brand_usd,
+sum (case when base.c_funnel_label='purchase' then base.spend_usd end) as spend_online_purchase_usd,
+sum (case when base.c_funnel_label='sale' then base.spend_usd end) as spend_online_sale_usd
+from base 
+where base.date_start<current_date 
+group by 1,2
+),
+users_kavak_com as (
+select  
+	event_time::date as fecha_evento,
+	country,
+	count (distinct 	
+		case when event_type='vip_viewed' 
+		then merged_amplitude_id 
+		end) as users_vip
+	,count (distinct 
+		case when event_type='year_viewed' 
+		then merged_amplitude_id 
+		end ) as users_cotizador
+--	from clientes_unicos
+	from serving.amplitude_events_ssa aes 
+		group by 1,2	
+		),
+funnel_compras as (
+-- para Arg todo el funnel de registros a compras
+-- para new countries metricas de inspecciones y trade in   (upper funnel >> bbdd pricing, metricas de compras >> sheets ERP)
+ with funnel_compras_ar as (
+	with mv_core_registros_compras_ar as (
+		with ultima_inspeccion as (
+			with ids_hub as (
+				SELECT 
+				bk_nts_location_object as id_hub_netsuite,
+				nts_location_name as lugar_de_inspeccion
+				FROM dwh.dim_location x
+				where nts_country ='AR'
+				and nts_is_logical_location = false
+				and nts_location_name<>'Phillips III'
+				order by 1)	
+			select *
+			from(
+				select
+				oportunidad_id,
+				inspeccion_id,
+				oi.list_item_name as origen_inspeccion,
+				e.email as inspector_mail,
+				e.full_name as inspector_nombre,
+				date(e.hireddate) as inspector_fecha_ingreso_kavak,
+				ids_hub.lugar_de_inspeccion,
+				ROW_NUMBER() over (partition by oportunidad_id order by i.date_created desc) as fila
+				FROM netsuite_global_refined.inspeccion i
+				left join netsuite_global_refined.origen_de_inspeccion oi on oi.list_id = i.origen_id 
+				left join netsuite_global_refined.employees e on i.inspector_id = e.employee_id
+				left join ids_hub on ids_hub.id_hub_netsuite= i.tipo_lugar_inspeccion_v2_id)
+			where fila=1)
+		select
+		date(fr.register_creation_date) as fecha_registro,
+		fr.quotenumber::int as id_oportunidad_netsuite,
+		fr.opportunity_id::int as id_oportunidad_backend,
+		fr.fk_client as id_cliente,
+		fr.customer_email as mail_cliente,
+		dc.phone as telefono_cliente,
+		fr.platform as plataforma_origen_registro,
+		fr.sku,
+		split_part(fr.amt_main_km,' ',1) as kilometraje,
+		fr.amt_main_market_price as precio_mercado,
+		fr.amt_main_inst_offer  as oferta_instantanea,
+		fr.amt_main_tradein_offer as oferta_tradein,
+		fr.monto_minimo_coche_venta,
+		date(fr.inspection_creation_date) as inspeccion_fecha_creada, -- inspection_start_date  no esta el campo fecha de inspeccion sobre la opp (la borraria)
+		-- podriamos sumar la fecha de creacion de la ultima inspeccion como inspection_creation_date
+		date(fr.fecha_confirmacion_inspeccion) as inspeccion_fecha_confirmacion,
+		date(fr.inspection_start_date) as inspeccion_fecha_agendada,
+		date(fr.inspection_made_date) as inspeccion_fecha_realizada,
+		case when flag_approved=1 then date(fr.inspection_made_date) end as inspeccion_fecha_aprobada,
+		case when flag_approved=0 then date(fr.inspection_made_date) end as inspeccion_fecha_rechazada,
+		fr.amt_main_legal_discount as descuentos_legales,
+		fr.amt_main_mechanic_discount as descuentos_mecanicos,
+		fr.amt_bonification as bonificaciones,
+		ultima_inspeccion.inspeccion_id,
+		ultima_inspeccion.origen_inspeccion,
+		ultima_inspeccion.inspector_nombre,
+		ultima_inspeccion.inspector_mail,
+		ultima_inspeccion.inspector_fecha_ingreso_kavak,
+		ultima_inspeccion.lugar_de_inspeccion,
+		purchase_date,
+		date(fr.purchase_date) as fecha_compra, 
+		dcs.bk_car_stock as stock_id,
+		-- sumaria flag_register (es siempre 1)
+		fr.flag_register,
+		-- sumar
+		fr.flag_succesful_quotes, -- solo usa oferta_maxima_instantanea  (estan quedando afuera ) cambiar por amt_main_tradein_offer
+		fr.flag_scheduled,
+		fr.flag_confirmed,
+		fr.flag_made,
+		fr.flag_approved,
+		fr.flag_trade_in,
+		case when fr.purchase_date is not null then 1 else 0 end as flag_purchase,
+		fr.flag_purchase_b2b,
+		fr.flag_purchase_c2b,
+		case when fr.purchase_date is not null and date(fr.contract_signing_date)=date(fr.inspection_made_date) 
+		then 1 else 0 end as flag_same_day,  -- en fact_registers esta flag_same_day
+		fr.flag_auto_quotations,
+		fr.flag_manual_quotations,
+		fr.flag_online_schedule,
+		fr.b2b,
+		case when fr.amt_main_inst_offer is null and fr.amt_main_tradein_offer is not null then 1 else 0 end as flag_solo_trade_in
+		FROM dwh.fact_registers fr 
+		left join dwh.dim_car_stock dcs on dcs.sk_car_stock = fr.fk_car_stock 
+		left join dwh.dim_client dc on dc.sk_client = fr.fk_client
+		left join ultima_inspeccion on ultima_inspeccion.oportunidad_id = fr.opportunity_id 
+		where fr.country ='AR'
+		and (date(fr.register_creation_date)>='2021-11-01' or fr.flag_purchase_b2b=1)
+		)	
+	,version_detail as (
+		select
+		sku,
+		blacklist 
+		from stg.stg_sku_version_detail 
+		where country_id =32
+	),
+	autos_2da as (
+		select distinct stock_id,auto_cangrejo
+ 		from netsuite_global_refined.inventory_items
+	)	
+	, registros_AR as (
+		select
+		fecha_registro,
+		sum(flag_register) as registers,
+	--	sum(flag_succesful_quotes) as quotations,
+		sum(case when blacklist in ('True') or version_detail.sku is null then 1 end) as not_successful,
+		sum(case when blacklist not in ('True') and version_detail.sku is not null then 1 end) as successful_registers,
+		sum(case when flag_manual_quotations = 1 or flag_auto_quotations = 1 then flag_register end) as quotations,
+		sum(flag_auto_quotations) as auto_quotations,
+		sum(flag_manual_quotations) as manual_quotations,
+		sum(flag_online_schedule) as online_schedules	
+		from
+		mv_core_registros_compras_ar
+		left join  version_detail on mv_core_registros_compras_ar.sku=version_detail.sku
+		group by 1
+	)
+	, inspecciones_AR as (
+		select
+		inspeccion_fecha_confirmacion,
+		0 as inspections_scheduled,
+		sum(flag_confirmed) as inspections_confirmed
+		from
+		mv_core_registros_compras_ar 
+		where b2b = 0
+		group by 1,2
+	)	
+	, inspecciones_cp_AR as (
+		select
+		inspeccion_fecha_agendada,
+		sum(flag_scheduled) as inspections_scheduled_cp,
+		sum(flag_confirmed) as inspections_confirmed_cp
+		from
+		mv_core_registros_compras_ar
+		where b2b = 0
+		group by 1
+	)	
+	, inspecciones_made_AR as (
+		select
+		inspeccion_fecha_realizada,
+		sum(flag_made) as inspections_made,
+		sum(flag_approved) as inspections_approved
+		from
+		mv_core_registros_compras_ar
+		where b2b = 0
+		group by
+		1
+	)	
+	, compras_AR as (
+		select
+		fecha_compra,
+		sum(flag_purchase) as purchases,
+		sum(case when flag_purchase_b2b=0 then flag_purchase end) as purchases_c2b,
+		sum(flag_purchase_b2b) as purchases_b2b,
+		sum(flag_same_day) as purchases_sdp,
+		sum(flag_trade_in) as purchases_trade_in
+		from
+		mv_core_registros_compras_ar
+		left join autos_2da on autos_2da.stock_id = mv_core_registros_compras_ar.stock_id
+		where autos_2da.auto_cangrejo<>'T'
+		group by
+		1
+	)
+select 
+registros_AR.fecha_registro as fecha,
+'AR' as country,
+registros_AR.registers,
+registros_AR.not_successful,
+registros_AR.successful_registers,
+registros_AR.quotations,
+registros_AR.auto_quotations,
+registros_AR.manual_quotations,
+0 as no_cotizables,
+registros_AR.online_schedules,
+inspecciones_AR.inspections_scheduled,
+inspecciones_AR.inspections_confirmed,
+inspecciones_cp_AR.inspections_scheduled_cp,
+inspecciones_cp_AR.inspections_confirmed_cp,
+inspecciones_made_AR.inspections_made,
+inspecciones_made_AR.inspections_approved,
+compras_AR.purchases,
+compras_AR.purchases_c2b,
+compras_AR.purchases_b2b,
+compras_AR.purchases_sdp,
+compras_AR.purchases_trade_in
+from registros_AR
+left join inspecciones_AR on registros_AR.fecha_registro=inspecciones_AR.inspeccion_fecha_confirmacion
+left join inspecciones_cp_AR on registros_AR.fecha_registro=inspecciones_cp_AR.inspeccion_fecha_agendada
+left join inspecciones_made_AR on registros_AR.fecha_registro=inspecciones_made_AR.inspeccion_fecha_realizada
+left join compras_AR on registros_AR.fecha_registro=compras_AR.fecha_compra
+where registros_AR.fecha_registro<current_date 
+) 
+	, funnel_compras_nc as (
+	-- inspecciones  NC
+	with base as (
+		with inspection as (
+			select  
+				id,
+				createddate::date as fecha_creada,  
+				createdbyid,
+				Country__c,
+				Account__c,
+				status__c,
+				DateTime__c::date as fecha_inspeccion
+			from salesforce_ssa_refined.inspection__c i 
+			where Country__c in ('CL','CO','PE')  
+				and isdeleted='false'
+			),			
+		inspection__history as(
+			select  
+				parentid, 
+				min (createddate::date) as fecha_confirmacion
+			from salesforce_ssa_refined.inspection__history sih 
+			where field='Status__c' 
+				and newvalue<>'Cancelada' 
+				and newvalue<>'Pendiente' 
+			group by 1)			
+		select 
+			inspection.id,
+			inspection.Country__c,
+			inspection.Account__c,
+			inspection.status__c, 
+			inspection.fecha_creada,
+			inspection.fecha_inspeccion,
+			case when inspection.createdbyid='0055Y00000GWYkKQAX' then 1 
+				end as flag_online,
+			case when inspection__history.fecha_confirmacion is not null and inspection.status__c<>'Pendiente' then inspection__history.fecha_confirmacion 
+				else case when inspection.status__c<>'Pendiente' and inspection.status__c<>'Cancelada' then fecha_creada end
+				end as fecha_confirmacion,
+			case when inspection__history.parentid is not null and inspection.status__c='Cancelada' then 1 
+				else case when inspection.status__c<>'Pendiente' and inspection.status__c<>'Cancelada' then 1 end
+				end as flag_confirmed,
+			case when inspection.status__c in ('Aprobada','Rechazada') then 1 
+				end as flag_made,
+			case when inspection.status__c in ('Aprobada') then 1 
+				end as flag_approved
+		from  inspection
+		left join inspection__history on inspection.id=inspection__history.parentid
+	),
+	fecha_pais as (
+	select * from
+	(select distinct
+	cast (createddate as date) as fecha 
+	from salesforce_ssa_refined.opportunity 
+	where createddate>='2022-01-01' ) f
+	left join (
+	select distinct country__c 
+	from salesforce_ssa_refined.opportunity 
+	where country__c in ('CL','CO','PE')
+	) p
+	on 1=1
+	)
+	select 
+		fecha_pais.*,
+		0 as registers,
+		0 as not_successful,
+		0 as successful_registers,
+		0 as quotations,
+		0 as auto_quotations,
+		0 as manual_quotations,
+		0 as no_cotizables,
+		a.online_schedule,
+		a.scheduled,
+		confirmed.confirmed,
+		b.scheduled_cp,
+		b.confirmed_cp,
+		b.made,
+		b.approved,
+		0 as purchases,
+		0 as purchases_c2b,
+		0 as purchases_b2b,
+		0 as purchases_sdp,
+		c.trade_in
+	from 
+	fecha_pais
+	left join (
+		select 
+			fecha_creada,
+			Country__c,
+			count (distinct Account__c) as scheduled,
+			count (distinct case when flag_online=1 then Account__c end) as online_schedule
+		from base
+		group by 1,2) a
+	on fecha_pais.fecha=a.fecha_creada and fecha_pais.country__c=a.country__c
+	left join (
+		select 
+			fecha_inspeccion,
+			Country__c,
+			count (distinct Account__c) as scheduled_cp,
+			count (distinct case when flag_confirmed=1 then Account__c end) as confirmed_cp,
+			count (distinct case when flag_made=1 then Account__c end) as made,
+			count (distinct case when flag_approved=1 then Account__c end) as approved
+		from base
+		group by 1,2) b 
+	on fecha_pais.fecha=b.fecha_inspeccion and fecha_pais.country__c=b.Country__c
+	left join (
+		select 
+			fecha_confirmacion,
+			Country__c,
+			count (distinct case when flag_confirmed=1 then Account__c end) as confirmed
+		from base
+		group by 1,2) confirmed
+	on fecha_pais.fecha=confirmed.fecha_confirmacion and fecha_pais.country__c=confirmed.Country__c
+	-- trade ins
+	left join (
+		select 
+			cast (d.ScheduledDate__c as date) as fecha,
+			o.Country__c,
+			count (distinct o.id) as trade_in
+		from (select * from salesforce_ssa_refined.opportunity 
+		where recordtypename__c='Trade_In_ARG' and country__c in ('PE')  and stagename in ('Cerrada ganada','Entrega') ) o
+		left join salesforce_ssa_refined.delivery__c d
+		on o.id=d.Opportunity__c
+		group by 1,2) c
+	on fecha_pais.fecha=c.fecha and fecha_pais.country__c=c.Country__c
+)
+select * from funnel_compras_ar
+union all select * from funnel_compras_nc
+),
+opps as (
+select 
+cast (createddate as date) as fecha,
+country,
+sum (case when tipo='kavak.com' then flag_unique end) as opps_kavak_com,
+sum (case when tipo='classifieds' then flag_unique end) as opps_classifieds
+from playground.mv_core_all_opps_ssa where flag_unique=1
+group by 1,2 ),
+visitas as (
+with fecha_pais as (
+	with fecha as (
+			select distinct 
+			date as fecha
+			from  dwh.dim_date  
+			where date>='2022-01-01' and date<=current_date),
+	pais as (
+			select distinct  
+			country_iso as pais
+			from dwh.dim_geography dg 
+			where country_iso in ('PE'))
+	select *
+	from fecha
+	left join pais on 1=1),	
+	base as (
+		with a as (
+			select  
+			id,
+			cast(createddate as date) as fecha,  
+			Country__c,
+			Account__c,
+			opportunity__c,
+			status__c,
+			OwnerId,
+			cast (ScheduledDate__c as date) as fecha_agendada
+			from salesforce_ssa_refined.appointment__c  
+			where Country__c in ('PE')  and isdeleted='false'),			
+		b as(
+			select  
+			parentid, 
+			min (cast(createddate as date)) as fecha_confirmacion
+			from salesforce_ssa_refined.appointment__history ah 
+			where field='Status__c' and newvalue<>'Cancelada' and newvalue<>'Pendiente' 
+			group by 1)			
+		select 
+		a.id,
+		b.parentid,
+		fecha,
+		fecha_agendada,
+		Country__c as pais,
+		Account__c,
+		status__c, 
+		OwnerId,
+		case when b.fecha_confirmacion is not null and status__c<>'Pendiente' then b.fecha_confirmacion else
+		case when status__c<>'Pendiente' and status__c<>'Cancelada' then fecha end
+		end as fecha_confirmacion,
+		case when parentid is not null and status__c='Cancelada' then 1 else
+		case when status__c<>'Pendiente' and status__c<>'Cancelada' then 1 end
+		end as flag_confirmed,
+		case when status__c in ('Cliente en Hub','En curso','Realizada') then 1 end as flag_made
+		from  a
+		left join  b
+		on a.id=b.parentid
+	),	
+scheduled as (
+	select 
+	fecha,  
+	pais,
+	count (distinct Account__c) as appointments_scheduled
+	from base
+	group by 1,2 ),
+confirmed as (
+	select 
+	fecha_confirmacion,  
+	pais,
+	count (distinct case when flag_confirmed=1 then Account__c end) as appointments_confirmed
+	from base
+	group by 1,2 ),
+scheduled_cp as (
+	select 
+	fecha_agendada,
+	pais,
+	count (distinct Account__c) as appointments_scheduled_cp,
+	count (distinct case when flag_confirmed=1 then Account__c end) as appointments_confirmed_cp,
+	count (distinct case when status__c in ('Cliente en Hub','En curso','Realizada') then Account__c end ) as appointments_made
+	from base
+	group by 1,2 )
+select 
+fecha_pais.*,
+scheduled.appointments_scheduled,
+confirmed.appointments_confirmed,
+scheduled_cp.appointments_scheduled_cp,
+scheduled_cp.appointments_confirmed_cp,
+scheduled_cp.appointments_made
+from fecha_pais
+left join scheduled
+on fecha_pais.fecha=scheduled.fecha
+and fecha_pais.pais=scheduled.pais
+left join confirmed
+on fecha_pais.fecha=confirmed.fecha_confirmacion
+and fecha_pais.pais=confirmed.pais
+left join  scheduled_cp
+on fecha_pais.fecha=scheduled_cp.fecha_agendada
+and fecha_pais.pais=scheduled_cp.pais
+),
+funnel_sales_ar as (
+	with fechas as (
+		select distinct 
+		date as fecha
+		from  dwh.dim_date  
+		where date>='2022-01-01' and date<current_date),
+	bookings as (
+		select booking_creation_date, bk_booking  
+		from stg.booking_prep bp 
+		where custom_form_id=327 ),			
+	gross_sales as (
+		select declared_sale_date, bk_booking  
+		from stg.booking_prep bp 
+		where custom_form_id=327 and declared_sale_date is not null ),			
+	cancelled_sales as (
+		select closed_date, bk_booking  
+		from stg.booking_prep bp 
+		where custom_form_id=327 and closed_date is not null and declared_sale_date is not null )	
+select 
+fechas.fecha,
+'AR' as pais,
+count(distinct bookings.bk_booking) as bookings,
+count(distinct gross_sales.bk_booking) as gross_sales,
+count(distinct cancelled_sales.bk_booking) as cancelled_sales
+from fechas 
+left join bookings on fechas.fecha=bookings.booking_creation_date
+left join gross_sales on fechas.fecha=gross_sales.declared_sale_date
+left join cancelled_sales on fechas.fecha=cancelled_sales.closed_date
+group by 1,2
+),
+entregas_ar as (
+	with base_entregas as (
+		select 
+		cast(dc.ScheduledDate__c as date) as fecha,
+		o.SalesDomain__c
+		from salesforce_ssa_refined.delivery__c dc 
+		left join salesforce_ssa_refined.opportunity  o  on dc.Opportunity__c=o.id
+	where dc.country__c='AR' and dc.Status__c='Realizada' and dc.isdeleted='false'
+	)
+	select 
+	fecha,
+	'AR' as pais,
+	count (distinct SalesDomain__c) as deliveries
+	from base_entregas
+	group by 1,2
+),
+devoluciones_ar as (
+with casos_devolucion as (
+		select 
+		cas.id, 
+		case when cas.ClosedDate<>'null' then left(cas.ClosedDate,10) end as ClosedDate, 
+		cas.Status, 
+		cas.accountid,
+		(case 
+		when cas.salesdomain__c is null then cas.Patente__c 
+		when cas.salesdomain__c ='null' then cas.Patente__c 
+		else cas.salesdomain__c 
+		end ) as Patente_Casos_PV 
+		from salesforce_ssa_refined.case cas
+		where ((cas.CreatedDate)>= '2022-02-01') and (cas.country__c ='null' or cas.country__c  ='AR') 
+		and cas.isdeleted ='false'
+		and 
+		(cas.Detalle__c ='Solicita Cambio del auto' or
+		cas.Detalle__c ='Solicita Devolución del auto' or 
+		cas.Detalle__c ='Cliente solicita devolución de dinero' or 
+		cas.Detalle__c ='Cliente solicita cambio de auto (saldo a favor)'
+		)
+		and cas.Etapa__c<>'Cancelado'
+	)
+select 
+		cd.closeddate as fecha,
+		'AR' as pais,
+		count (distinct o.SalesDomain__c) as devoluciones
+		from salesforce_ssa_refined.delivery__c dc 
+		left join salesforce_ssa_refined.opportunity  o  on dc.Opportunity__c=o.id
+		left join casos_devolucion cd  on dc.account__c=cd.accountid and 
+		o.SalesDomain__c=cd.Patente_Casos_PV
+	where dc.country__c='AR' and dc.Status__c='Realizada' and dc.isdeleted='false' and cd.closeddate is not null
+	group by 1,2
+	order by 1 desc
+)-- -------------------
+select
+fecha_pais.*,
+case when spend.spend_online_brand_usd is null then 0 else spend_online_brand_usd end as spend_online_brand_usd,
+case when spend.spend_online_purchase_usd is null then 0 else spend_online_purchase_usd end as spend_online_purchase_usd,
+case when spend.spend_online_sale_usd is null then 0 else spend_online_sale_usd end as spend_online_sale_usd,
+0 as spend_classifieds_sale_usd,         
+--0 as users_vip,
+--0 as users_cotizador,
+case when users_kavak_com.users_vip is null then 0 else users_kavak_com.users_vip end as users_vip,
+case when users_kavak_com.users_cotizador is null then 0 else users_kavak_com.users_cotizador end as users_cotizador,
+case when funnel_compras.registers is null then 0 else funnel_compras.registers end as registers,
+case when funnel_compras.not_successful is null then 0 else funnel_compras.not_successful end as not_successful,
+case when funnel_compras.successful_registers is null then 0 else funnel_compras.successful_registers end as successful_registers,
+case when funnel_compras.quotations is null then 0 else funnel_compras.quotations end as quotations,
+case when funnel_compras.auto_quotations is null then 0 else funnel_compras.auto_quotations end as auto_quotations,
+case when funnel_compras.manual_quotations is null then 0 else funnel_compras.manual_quotations end as manual_quotations,
+case when funnel_compras.no_cotizables is null then 0 else funnel_compras.no_cotizables end as no_cotizables,
+case when funnel_compras.online_schedules is null then 0 else funnel_compras.online_schedules end as online_schedules,
+case when funnel_compras.inspections_scheduled is null then 0 else funnel_compras.inspections_scheduled end as inspections_scheduled,
+case when funnel_compras.inspections_confirmed is null then 0 else funnel_compras.inspections_confirmed end as inspections_confirmed,
+case when funnel_compras.inspections_scheduled_cp is null then 0 else funnel_compras.inspections_scheduled_cp end as inspections_scheduled_cp,
+case when funnel_compras.inspections_confirmed_cp is null then 0 else funnel_compras.inspections_confirmed_cp end as inspections_confirmed_cp,
+case when funnel_compras.inspections_made is null then 0 else funnel_compras.inspections_made end as inspections_made,
+case when funnel_compras.inspections_approved is null then 0 else funnel_compras.inspections_approved end as inspections_approved,
+case when funnel_compras.purchases is null then 0 else funnel_compras.purchases end as purchases,
+case when funnel_compras.purchases_c2b is null then 0 else funnel_compras.purchases_c2b end as purchases_c2b,
+case when funnel_compras.purchases_b2b is null then 0 else funnel_compras.purchases_b2b end as purchases_b2b,
+case when funnel_compras.purchases_sdp is null then 0 else funnel_compras.purchases_sdp end as purchases_sdp,
+case when funnel_compras.purchases_trade_in is null then 0 else funnel_compras.purchases_trade_in end as purchases_trade_in,
+case when opps.opps_kavak_com is null then 0 else opps.opps_kavak_com end as opps_kavak_com,
+case when opps.opps_classifieds is null then 0 else opps.opps_classifieds end as opps_classi,
+case when visitas.appointments_scheduled is null then 0 else visitas.appointments_scheduled end as appointments_scheduled,
+case when visitas.appointments_scheduled_cp is null then 0 else visitas.appointments_scheduled_cp end as appointments_scheduled_cp,
+case when visitas.appointments_made is null then 0 else visitas.appointments_made end as appointments_made,
+case when funnel_sales_ar.bookings is null then 0 else funnel_sales_ar.bookings end as bookings,
+0 as fake_bookings,         
+case when funnel_sales_ar.gross_sales is null then 0 else funnel_sales_ar.gross_sales end as gross_sales,
+case when funnel_sales_ar.cancelled_sales is null then 0 else funnel_sales_ar.cancelled_sales end as cancelled_sales,
+case when entregas_ar.deliveries is null then 0 else entregas_ar.deliveries end as deliveries,
+case when visitas.appointments_confirmed is null then 0 else visitas.appointments_confirmed end as appointments_confirmed,
+case when visitas.appointments_confirmed_cp is null then 0 else visitas.appointments_confirmed_cp end as appointments_confirmed_cp,
+case when devoluciones_ar.devoluciones is null then 0 else devoluciones_ar.devoluciones end as devoluciones,
+current_date
+from
+fecha_pais
+left join spend
+on fecha_pais.fecha=spend.fecha
+and fecha_pais.pais_iso=spend.pais
+left join users_kavak_com 
+on fecha_pais.fecha=users_kavak_com.fecha_evento
+and fecha_pais.pais=users_kavak_com.country
+left join funnel_compras 
+on fecha_pais.fecha=funnel_compras.fecha
+and fecha_pais.pais_iso=funnel_compras.country
+left join opps 
+on fecha_pais.fecha=opps.fecha
+and fecha_pais.pais_iso=opps.country
+left join visitas 
+on fecha_pais.fecha=visitas.fecha
+and fecha_pais.pais_iso=visitas.pais 
+left join funnel_sales_ar 
+on fecha_pais.fecha=funnel_sales_ar.fecha
+and fecha_pais.pais_iso=funnel_sales_ar.pais
+left join entregas_ar 
+on fecha_pais.fecha=entregas_ar.fecha
+and fecha_pais.pais_iso=entregas_ar.pais
+left join devoluciones_ar 
+on fecha_pais.fecha=devoluciones_ar.fecha
+and fecha_pais.pais_iso=devoluciones_ar.pais
+order by fecha desc
